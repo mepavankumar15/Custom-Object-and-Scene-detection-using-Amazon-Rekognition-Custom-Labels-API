@@ -1,0 +1,660 @@
+## Upgrade boto3 and botocore
+!pip install botocore --upgrade
+!pip install boto3 --upgrade
+import json
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from os import listdir, makedirs
+from os.path import isfile, join
+import shutil
+
+import boto3
+from IPython.display import HTML, display, Image as IImage
+from PIL import Image, ImageDraw, ImageFont
+import time
+import os
+
+from IPython.display import JSON
+# Curent AWS Region. Use this to choose corresponding S3 bucket with sample content
+
+mySession = boto3.session.Session()
+awsRegion = mySession.region_name
+print ("AWS Region : " + awsRegion)
+# Init clients
+rekognition = boto3.client('rekognition')
+s3 = boto3.client('s3')
+## Please replace the <rek_cl_default_bucket_name> with the value of the Amazon S3 bucket name captured above. It will be different in your case.
+rek_cl_default_bucket = "<rek_cl_default_bucket_name>"
+## Download the images in the dataset from Stanford University found here - http://vision.stanford.edu/aditya86/ImageNetDogs/.
+## Please note you comply with all license requirements before downloading the datasets.
+## You may manually download the dataset and place it in the respective directories in the your current directory.
+## The below sample code snippet provides guidance around the steps for downloading the dataset .
+
+## Dataset and Annotation dataset url
+stanford_dog_dataset_image_url = "http://vision.stanford.edu/aditya86/ImageNetDogs/images.tar"
+stanford_dog_dataset_annotation_url = "http://vision.stanford.edu/aditya86/ImageNetDogs/annotation.tar"
+
+## Creating directories in the current location
+!mkdir -p ./stanford_dog_dataset/images_tar
+!mkdir -p ./stanford_dog_dataset/images
+!mkdir -p ./stanford_dog_dataset/annotation_tar
+!mkdir -p ./stanford_dog_dataset/annotation
+
+## Download the dataset to the directories created above
+!curl $stanford_dog_dataset_image_url --output ./stanford_dog_dataset/images_tar/images.tar
+!curl $stanford_dog_dataset_annotation_url --output ./stanford_dog_dataset/annotation_tar/annotation.tar
+
+
+## Unzipping the downlaoded datasets.
+!tar -xf ./stanford_dog_dataset/images_tar/images.tar -C ./stanford_dog_dataset/images --no-same-owner
+!tar -xf ./stanford_dog_dataset/annotation_tar/annotation.tar -C ./stanford_dog_dataset/annotation --no-same-owner
+'''
+  Prepare the datasets and generating manifest file
+The original dataset contains 120 classes and 20,000+ images.
+This is possible to train with custom labels, but it will take many hours.
+In order to reduce the training time we will trim the classes to 3 and give them easier to read names.
+We will also demonstrate the generation of a Amazon Sageamker Groundtruth manifest file from the XML format annotation available with the public dataset.
+We will also select 1 image from each class along with an image from unknown class and keep it aside as a holdout dataset.
+
+'''
+## Function to convert a list of stanford dog dataset annotation to generate a single Amazon Sagemaker groundtruth manifest file.
+def generate_manifest_file (stanford_dog_dataset_annotation, final_manifest_file_path):
+    final_file=[]
+    class_dict={}
+    for filename in stanford_dog_dataset_annotation:
+        file_pth = filename.replace('/images/Images/','/annotation/Annotation/').replace('.jpg','')
+        # print(file_pth)
+        file = open(file_pth, mode = 'r' )
+        annt = file.read()
+        # print (annt)
+        singl_file = {}
+        # print ("\n")
+        root = ET.fromstring(annt)
+        img_size = {}
+        img_nm = None
+        for child in root:
+            if (child.tag == 'filename'):
+                # print (child.text)
+                img_nm = child.text
+
+            if (child.tag == 'size'):
+                for elem in child.iter():
+                    if (elem.tag == 'width'):
+                        # print (elem.text)
+                        img_size["width"]=int(elem.text)
+                    if (elem.tag == 'height'):
+                        # print (elem.text)
+                        img_size["height"] = int(elem.text)
+                    if (elem.tag == 'depth'):
+                        # print (elem.text)
+                        img_size["depth"] = int(elem.text)
+        # print (json.dumps(singl_file))
+        annotations = []
+        objects = []
+        class_map = {}
+        objcts = root.findall('object')
+        # print (len(objcts))
+        for objct in objcts:
+            annotation = {}
+            confidence = {}
+            class_nm = None
+            class_id = None
+            for elem in objct.iter():
+                if (elem.tag == 'name'):
+                    # print(elem.text)
+                    class_nm = elem.text
+                    class_id = class_dict.get(class_nm, None)
+                    if class_id == None:
+                        if len(class_dict) == 0:
+                            class_id = 0
+                        else:
+                            all_values = class_dict.values()
+                            max_value = max(all_values)
+                            class_id = int(max_value) + 1
+                        class_dict[class_nm] = class_id
+
+                if (elem.tag == 'bndbox'):
+                    xmin = ymin = xmax = ymax = 0
+                    for subelem in elem.iter():
+                        if (subelem.tag == 'xmin'):
+                            # print(subelem.text)
+                            xmin = int(subelem.text)
+                        if (subelem.tag == 'ymin'):
+                            # print(subelem.text)
+                            ymin = int(subelem.text)
+                        if (subelem.tag == 'xmax'):
+                            # print(subelem.text)
+                            xmax = int(subelem.text)
+                        if (subelem.tag == 'ymax'):
+                            # print(subelem.text)
+                            ymax = int(subelem.text)
+
+                    annotation["class_id"] = class_id
+                    annotation["top"] = ymin
+                    annotation["left"] = xmin
+                    annotation["width"] = xmax - xmin
+                    annotation["height"] = ymax - ymin
+                    annotations.append(annotation)
+
+                    confidence["confidence"] = 1
+                    objects.append(confidence)
+
+                    class_map[class_id] = class_nm
+        bbx = {
+            "image_size" : [img_size],
+            "annotations" : annotations
+        }
+
+        bbx_mtdata = {
+            "objects" : objects,
+            "class-map" : class_map,
+            "type": "groundtruth/object-detection",
+            "human-annotated": "yes",
+            "creation-date": datetime.today().strftime('%Y-%m-%dT%H:%m:%S'), 
+            "job-name": "testjob"
+        }
+
+
+        singl_file = {
+            "source-ref" : f's3://{rek_cl_default_bucket}/stanford_dog_dataset/dataset/{img_nm}.jpg',
+            "bounding-box" : bbx,
+            "bounding-box-metadata" : bbx_mtdata
+
+        }
+
+        # print (json.dumps(singl_file))
+        imglbl = json.dumps(singl_file)
+        final_file.append(imglbl + " \n")
+        file.close()
+    
+    file1 = open(final_manifest_file_path, "w")
+    file1.writelines(final_file)
+    file1.close()
+  classes_to_be_trained = [
+    "n02090379-redbone", 
+    "n02099601-golden_retriever", 
+    "n02107142-Doberman" 
+]
+
+holdoutset_list = {
+    "n02090379-redbone" : "./stanford_dog_dataset/images/Images/n02090379-redbone/n02090379_1799.jpg",
+    "n02099601-golden_retriever" : "./stanford_dog_dataset/images/Images/n02099601-golden_retriever/n02099601_3388.jpg",
+    "n02107142-Doberman" : "./stanford_dog_dataset/images/Images/n02107142-Doberman/n02107142_385.jpg",
+    ## the below image is from a new class which is not included as part of the training set
+    "n02091831-Saluki" : "./stanford_dog_dataset/images/Images/n02091831-Saluki/n02091831_3909.jpg"
+}
+dataset_list = []
+
+## Generating trim dataset
+makedirs("./stanford_dog_dataset/holdout", exist_ok=True)
+for class_nm in classes_to_be_trained:
+    new_path = f'./stanford_dog_dataset/dataset/'
+    makedirs(new_path, exist_ok=True)
+    
+    existing_path = f'./stanford_dog_dataset/images/Images/{class_nm}'
+    onlyfiles = [join(existing_path, f) for f in listdir(existing_path) if isfile(join(existing_path, f))]
+    # remove the image from the list which is kept as part of the holdout dataset.
+    onlyfiles.remove(holdoutset_list[class_nm])
+    
+    for dataset_file_pth in onlyfiles:
+        dataset_list.append(dataset_file_pth)
+        dest_dataset_image_path = f'{new_path}/{dataset_file_pth.split("/")[-1]}'
+        shutil.copy(dataset_file_pth, dest_dataset_image_path)
+
+## Generating dataset manifest file
+generate_manifest_file (dataset_list, './stanford_dog_dataset/dataset/dataset.manifest')
+
+
+## Copying the holdout dataset images
+for class_nm, file_path in holdoutset_list.items():
+    dest_holdout_image_path = f'./stanford_dog_dataset/holdout/{class_nm.split("-")[-1]}.jpg'
+    shutil.copy(file_path, dest_holdout_image_path)
+    
+    
+    
+
+## Copy the datasets and holdout set to the Amazon Rekognition Custom Label default S3 bucket
+!aws s3 cp ./stanford_dog_dataset/dataset/ s3://$rek_cl_default_bucket/stanford_dog_dataset/dataset/ --recursive --quiet
+!aws s3 cp ./stanford_dog_dataset/holdout/ s3://$rek_cl_default_bucket/stanford_dog_dataset/holdout/ --recursive --quiet
+'''
+  Create an Amazon Rekognition Custom Label Project
+Create an Amazon Rekognition Custom Label Project using the APIs
+  '''
+cl_project = rekognition.create_project(
+    ProjectName='stanford_dogs_dataset_project'
+)
+JSON(cl_project)
+'''
+  Import the Datasets into the new Amazon Rekognition Custom Label Project using the APIs. In this section we will import the entire dataset as training dataset and later we will demonstrate how we can use the Amazon Rekgniton out of the box to automatically keep aside 20% of the dataset as Test dataset.
+
+Training Dataset -> A set of labeled or annotated images which will be used to train the model. The model will be trained on this dataset.
+Test Dataset -> A set of labeled or annotated images which will be used to evaluate the model.
+  '''
+## We will use the dataset.manifest file which was created earlier, to create a training dataset.
+cl_dataset_train = rekognition.create_dataset(
+                        DatasetSource={
+                            'GroundTruthManifest': {
+                                'S3Object': {
+                                    'Bucket': rek_cl_default_bucket,
+                                    'Name': 'stanford_dog_dataset/dataset/dataset.manifest'
+                                }
+                            }
+                        },
+                        DatasetType='TRAIN',
+                        ProjectArn=cl_project['ProjectArn']
+                    )
+JSON(cl_dataset_train)
+## Wait for the creation of the train dataset to complete
+chk_status = True
+starttime = time.time()
+while (chk_status):
+    ## wait for 2 minute. To check status every 2 minutes
+    time.sleep (120)
+    dataset_status = rekognition.describe_dataset(
+                            DatasetArn=cl_dataset_train['DatasetArn']
+                        )
+    if ( (dataset_status['DatasetDescription']['Status'] != 'CREATE_IN_PROGRESS') ):
+        chk_status = False
+    ## Continue to check for status for 1 hour
+    if ((time.time() - starttime) > 3600):
+        chk_status = False
+        # Raise an exception if needed
+        
+JSON(dataset_status)
+## We will a create an empty test dataset. As we will use the distribute dataset api later to keep aside 20% of training data for the training dataset
+cl_dataset_test = rekognition.create_dataset(
+                DatasetType='TEST',
+                ProjectArn=cl_project['ProjectArn']
+            )
+JSON(cl_dataset_test)
+## Wait for the creation of the empty test dataset to complete
+chk_status = True
+starttime = time.time()
+while (chk_status):
+    ## wait for 2 minute. To check status every 2 minutes
+    time.sleep (120)
+    dataset_status = rekognition.describe_dataset(
+                            DatasetArn=cl_dataset_test['DatasetArn']
+                        )
+    if ( (dataset_status['DatasetDescription']['Status'] != 'CREATE_IN_PROGRESS') ):
+        chk_status = False
+    ## Continue to check for status for 1 hour
+    if ((time.time() - starttime) > 3600):
+        chk_status = False
+        # Raise an exception if needed
+        
+JSON(dataset_status)
+  '''
+  Here we will use the distribute_dataset_entries API to automatically generate a Test dataset which will be used to evaluate the model.
+The activity of splitting the dataset needs to be done only once for each project. Later we can add images to the training or test dataset using the update_dataset_entries api to update/extend the training and test datasets.
+Another option would be to create a training and test dataset. Then use create_dataset api to create a training and test dataset for that project.
+  '''
+
+## Split the dataset that was created earlier into Training and Test dataset
+cl_distribute_dataset = rekognition.distribute_dataset_entries(
+                            Datasets=[
+                                {
+                                    'Arn': cl_dataset_train['DatasetArn']
+                                },
+                                {
+                                    'Arn': cl_dataset_test['DatasetArn']
+                                }
+                            ]
+                        )
+## Wait for the splitting of the dataset to complete
+chk_status = True
+starttime = time.time()
+while (chk_status):
+    ## wait for 2 minute. To check status every 2 minutes
+    time.sleep (120)
+    dataset_status_train = rekognition.describe_dataset(
+                                DatasetArn=cl_dataset_train['DatasetArn']
+                            )
+    dataset_status_test = rekognition.describe_dataset(
+                                DatasetArn=cl_dataset_test['DatasetArn']
+                            )
+    if ( (dataset_status_train['DatasetDescription']['Status'] != 'CREATE_IN_PROGRESS') and (dataset_status_test['DatasetDescription']['Status'] != 'CREATE_IN_PROGRESS') ):
+        chk_status = False
+    ## Continue to check for status for 1 hour
+    if ((time.time() - starttime) > 3600):
+        chk_status = False
+        # Raise an exception if needed
+        
+JSON(dataset_status_train)
+JSON(dataset_status_test)
+'''
+  Open Amazon Rekognition -> go to custom labels -> in Dashboard -> Go to Projects -> open the project created in Projects Panel and Verify the Datasets 
+  In Datasets You can see the Training Set and Test Set
+  Below the training dataset.. You can see the tab "Preparing Your Dataset" and below that they are images and labels 
+  in Labels We gave only 3 classes to reduce the training duration.. In this 3 classes we have 150 test subjects of Redbone dog images to train model
+  '''
+  ## Start Training the model
+model_version_name = f'model_v{str(int(time.time()))}'
+cl_train_model = rekognition.create_project_version(
+                        ProjectArn=cl_project['ProjectArn'],
+                        VersionName=model_version_name,
+                        OutputConfig={
+                            'S3Bucket': rek_cl_default_bucket,
+                            'S3KeyPrefix': 'stanford_dog_dataset/model_train'
+                        }
+                    )
+JSON(cl_train_model)
+## Wait for the training to finish. This may take 2 to 4 hours
+chk_status = True
+starttime = time.time()
+while (chk_status):
+    ## wait for 30 minute. To check status every 30 minutes
+    time.sleep (1800)
+    model_traing_status = rekognition.describe_project_versions(
+                                ProjectArn=cl_project['ProjectArn'],
+                                VersionNames=[
+                                               model_version_name
+                                            ]
+        
+                            )
+    if ( (model_traing_status['ProjectVersionDescriptions'][0]['Status'] != 'TRAINING_IN_PROGRESS') ):
+        chk_status = False
+    ## Continue to check for status for 10 hour
+    if ((time.time() - starttime) > 36000):
+        chk_status = False
+        # Raise an exception if needed
+        
+JSON(model_traing_status)
+model_metrics = rekognition.describe_project_versions(
+                                ProjectArn=cl_project['ProjectArn'],
+                                VersionNames=[
+                                               model_version_name
+                                            ]
+        
+                            )
+# model_metrics
+
+print ("F1 Score " + str(model_metrics['ProjectVersionDescriptions'][0]['EvaluationResult']['F1Score']))
+
+s3 = boto3.resource('s3')
+content_object = s3.Object(model_metrics['ProjectVersionDescriptions'][0]['EvaluationResult']['Summary']['S3Object']['Bucket'], 
+                          model_metrics['ProjectVersionDescriptions'][0]['EvaluationResult']['Summary']['S3Object']['Name'] )
+file_content = content_object.get()['Body'].read().decode('utf-8')
+json_content = json.loads(file_content)
+
+JSON(json_content)
+'''
+  after running above code to produce or make a Object Detection Model 
+  in model You have Evaluation ,Model Details , Use model , Tags 
+  In Evaluation Panel Try to view the test results 
+   At the Evaluation results Their will be Metrics provided by Aws model which has been produced by processing the data to keenly analyze the Performace rate of the Agent or Model
+  the Filtration and the accurcy rate of the agent can be verified in Performance tab
+'''
+  start_model = rekognition.start_project_version(
+                        ProjectVersionArn=model_metrics['ProjectVersionDescriptions'][0]['ProjectVersionArn'],
+                        MinInferenceUnits=1
+                    )
+JSON (start_model)
+## Wait for the model to start
+chk_status = True
+starttime = time.time()
+while (chk_status):
+    ## wait for 5 minute. To check status every 5 minutes
+    time.sleep (300)
+    model_start_status = rekognition.describe_project_versions(
+                                ProjectArn=cl_project['ProjectArn'],
+                                VersionNames=[
+                                               model_version_name
+                                            ]
+        
+                            )
+    if ( (model_start_status['ProjectVersionDescriptions'][0]['Status'] != 'STARTING') ):
+        chk_status = False
+    ## Continue to check for status for 1 hour
+    if ((time.time() - starttime) > 3600):
+        chk_status = False
+        # Raise an exception if needed
+        
+JSON(model_start_status)
+'''
+  Run tests on the holdout images
+Here we will use the detect_custom_labels API to retrieve the dog breeds. These images were kept aside and was not included into the training or test datasets.
+  '''
+#Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#PDX-License-Identifier: MIT-0 (For details, see https://github.com/awsdocs/amazon-rekognition-custom-labels-developer-guide/blob/master/LICENSE-SAMPLECODE.)
+
+import boto3
+import io
+import logging
+from PIL import Image, ImageDraw, ImageFont
+from IPython.display import HTML, display
+
+
+from botocore.exceptions import ClientError
+
+logger = logging.getLogger(__name__)
+
+def analyze_local_image(rek_client, model, photo, min_confidence):
+    """
+    Analyzes an image stored as a local file.
+    :param rek_client: The Amazon Rekognition Boto3 client.
+    :param s3_connection: The Amazon S3 Boto3 S3 connection object.
+    :param model: The ARN of the Amazon Rekognition Custom Labels model that you want to use.
+    :param photo: The name and file path of the photo that you want to analyze.
+    :param min_confidence: The desired threshold/confidence for the call.
+    """
+
+    try:
+        logger.info ("Analyzing local file: %s", photo)
+        image=Image.open(photo) 
+        image_type=Image.MIME[image.format]
+
+        if (image_type == "image/jpeg" or image_type== "image/png") == False:
+            logger.error("Invalid image type for %s", photo)
+            raise ValueError(
+                f"Invalid file format. Supply a jpeg or png format file: {photo}"
+            )
+            
+        # get images bytes for call to detect_anomalies
+        image_bytes = io.BytesIO()
+        image.save(image_bytes, format=image.format)
+        image_bytes = image_bytes.getvalue()
+
+        response = rek_client.detect_custom_labels(Image={'Bytes': image_bytes},
+            MinConfidence=min_confidence,
+            ProjectVersionArn=model)
+
+        show_image (image, response)
+        return len(response['CustomLabels'])
+
+    except ClientError as err:
+        logger.error(format(err))
+        raise
+    
+
+def analyze_s3_image(rek_client,s3_connection, model,bucket,photo, min_confidence):
+    """
+    Analyzes an image stored in the specified S3 bucket.
+    :param rek_client: The Amazon Rekognition Boto3 client.
+    :param s3_connection: The Amazon S3 Boto3 S3 connection object.
+    :param model: The ARN of the Amazon Rekognition Custom Labels model that you want to use.
+    :param bucket: The name of the S3 bucket that contains the image that you want to analyze.
+    :param photo: The name of the photo that you want to analyze.
+    :param min_confidence: The desired threshold/confidence for the call.
+    """
+
+    try:
+        #Get image from S3 bucket.
+        
+        logger.info("analyzing bucket: %s image: %s", bucket, photo)
+        s3_object = s3_connection.Object(bucket,photo)
+        s3_response = s3_object.get()
+        
+
+        stream = io.BytesIO(s3_response['Body'].read())
+        image=Image.open(stream)
+
+        image_type=Image.MIME[image.format]
+
+        if (image_type == "image/jpeg" or image_type== "image/png") == False:
+            logger.error("Invalid image type for %s", photo)
+            raise ValueError(
+                f"Invalid file format. Supply a jpeg or png format file: {photo}")
+                
+
+        img_width, img_height = image.size  
+        draw = ImageDraw.Draw(image)  
+        
+        #Call DetectCustomLabels 
+        response = rek_client.detect_custom_labels(Image={'S3Object': {'Bucket': bucket, 'Name': photo}},
+            MinConfidence=min_confidence,
+            ProjectVersionArn=model)
+
+        show_image (image, response)
+        return len(response['CustomLabels'])
+
+    except ClientError as err:
+        logger.error(format(err))
+        raise
+
+def show_image(image, response):
+    """
+    Displays the analyzed image and overlays analysis results
+    :param image: The analyzed image
+    :param response: the response from DetectCustomLabels
+    """
+    try: 
+        font_size=10
+        line_width=5
+
+        img_width, img_height = image.size  
+        draw = ImageDraw.Draw(image)  
+                
+        # calculate and display bounding boxes for each detected custom label       
+        image_level_label_height = 0
+        
+        for custom_label in response['CustomLabels']:
+            confidence=int(round(custom_label['Confidence'],0))
+            label_text=f"{custom_label['Name']}:{confidence}%"
+#             font = ImageFont.load("arial.pil")
+            fnt = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans.ttf", font_size)
+            text_width, text_height = draw.textsize(label_text,fnt)
+
+            logger.info(f"Label: {custom_label['Name']}") 
+            logger.info(f"Confidence:  {confidence}%")
+
+            # Draw bounding boxes, if present
+            if 'Geometry' in custom_label:
+                box = custom_label['Geometry']['BoundingBox']
+                left = img_width * box['Left']
+                top = img_height * box['Top']
+                width = img_width * box['Width']
+                height = img_height * box['Height']
+                
+                logger.info("Bounding box")
+                logger.info("\tLeft: {0:.0f}".format(left))
+                logger.info("\tTop: {0:.0f}".format(top))
+                logger.info("\tLabel Width: {0:.0f}".format(width))
+                logger.info("\tLabel Height: {0:.0f}".format(height))
+                
+                points = (
+                    (left,top),
+                    (left + width, top),
+                    (left + width, top + height),
+                    (left , top + height),
+                    (left, top))
+                #Draw bounding box and label text
+                draw.line(points, fill="limegreen", width=line_width)
+                draw.rectangle([(left + line_width , top+line_width), (left + text_width + line_width, top + line_width + text_height)],fill="black")
+                draw.text((left + line_width ,top +line_width), label_text, fill="limegreen", font=fnt) 
+            
+            #draw image-level label text.
+            else:
+                draw.rectangle([(10 , image_level_label_height), (text_width + 10, image_level_label_height+text_height)],fill="black")
+                draw.text((10,image_level_label_height), label_text, fill="limegreen", font=fnt)  
+
+                image_level_label_height += text_height
+            
+#         image.show()
+        display(image)
+
+    except Exception as err:
+        logger.error(format(err))
+        raise
+        
+
+def analyze_rekcl_bb(bckt_nm, pics, modelarn, minconfdnce):
+
+    try:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+        bucket=bckt_nm
+        photos=pics
+        model=modelarn
+        min_confidence=minconfdnce
+       
+
+        rek_client=boto3.client('rekognition')
+        
+        s3_connection = boto3.resource('s3')
+        for photo in photos:
+            label_count=analyze_s3_image(rek_client,
+                s3_connection,
+                model,
+                bucket,
+                photo,
+                min_confidence)
+            
+            
+            
+            
+
+        """
+        # Uncomment to analyze a local file. 
+        # Change photo to the path and file name of a local file.
+        label_count=analyze_local_image(rek_client,
+            model,
+            photo,
+            min_confidence)
+        
+        """ 
+        logger.info(f"Custom labels detected: {label_count}")
+
+    except ClientError as err:
+        print("A service client error occurred: " + format(err.response["Error"]["Message"]))
+    except ValueError as err:
+        print ("A value error occurred: " + format(err))
+## Test the model on the holdout dataset
+bucket_nm=rek_cl_default_bucket
+holdout_photos=[('stanford_dog_dataset/holdout/' + f) for f in listdir('./stanford_dog_dataset/holdout') if (isfile(join('./stanford_dog_dataset/holdout', f)) and ((f.split(".")[-1]) == 'jpg' ) )]
+model_arn=model_metrics['ProjectVersionDescriptions'][0]['ProjectVersionArn']
+min_confidence=70
+
+analyze_rekcl_bb(bucket_nm, holdout_photos, model_arn, min_confidence)
+'''
+  Stopping the Current On-work Model
+  '''
+stop_model = rekognition.stop_project_version(
+                        ProjectVersionArn=model_metrics['ProjectVersionDescriptions'][0]['ProjectVersionArn']
+                    )
+JSON (stop_model)
+## Wait for the model to stop
+chk_status = True
+starttime = time.time()
+while (chk_status):
+    ## wait for 5 minute. To check status every 5 minutes
+    time.sleep (300)
+    model_stop_status = rekognition.describe_project_versions(
+                                ProjectArn=cl_project['ProjectArn'],
+                                VersionNames=[
+                                               model_version_name
+                                            ]
+        
+                            )
+    if ( (model_stop_status['ProjectVersionDescriptions'][0]['Status'] != 'STOPPING') ):
+        chk_status = False
+    ## Continue to check for status for 1 hour
+    if ((time.time() - starttime) > 3600):
+        chk_status = False
+        # Raise an exception if needed
+        
+JSON(model_stop_status)
+'''
+You have successfully used Amazon Rekognition Custom Label APIs to run a end to end Rekognition Custom Label Training and Inference flows to detect dog breeds.
+You must have noticed that the image Saluki.jpg (this is an image of a dog which breed was not included in the training dataset) is incorrectly classified most probably as golden retriever becasue they look similar.
+  '''
